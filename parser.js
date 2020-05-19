@@ -1,8 +1,17 @@
 var logs = [];
 var config = {};
+var jiraIssueReplaceRegExp = /\[(\w+-\d.+?)\]/g;
+var jiraIssueTestRegExp = /(\w+-\d.+?)/g;
 
 var myEmailAddress = null;
 var myDisplayName = null;
+
+Date.prototype.yyyy_mm_dd = function() {
+  var mm = this.getMonth() + 1; // getMonth() is zero-based
+  var dd = this.getDate();
+
+  return [this.getFullYear(), (mm > 9 ? '' : '0') + mm, (dd > 9 ? '' : '0') + dd].join('-');
+};
 
 String.prototype.limit = function (limit) {
     return this.length > limit ? this.substr(0, limit) + '...' : this;
@@ -110,11 +119,15 @@ $(document).ready(function () {
             }
         });
 
-        var startString = localStorage.getItem('toggl-to-jira.last-date');
-        var startDate = config.jumpToToday || !startString ? new Date() : new Date(startString);
+//        var startString = localStorage.getItem('toggl-to-jira.last-date');
+        var startString = localStorage.getItem('toggl-to-jira.last-end-date');
+        var sDate = new Date(startString);
+        sDate.setDate(sDate.getDate()-1);
+        var startDate = config.jumpToToday || !startString ? new Date() : sDate;
         document.getElementById('start-picker').valueAsDate = startDate;
 
         var endString = localStorage.getItem('toggl-to-jira.last-end-date');
+        endString = '';
         var endDate = config.jumpToToday || !endString ? new Date(Date.now() + (3600 * 24 * 1000)) : new Date(endString);
         document.getElementById('end-picker').valueAsDate = endDate;
 
@@ -122,7 +135,7 @@ $(document).ready(function () {
         $('#end-picker').on('change', fetchEntries);
         $('#submit').on('click', submitEntries);
 
-        getMyData()
+        getMyData();
         fetchEntries();
     });
 });
@@ -134,11 +147,32 @@ function getMyData() {
         function success(response) {
             myEmailAddress = response.emailAddress;
             myDisplayName = response.displayName;
+            
+            $('#myJiraDisplayName').html(myDisplayName + ' (' + myEmailAddress + ')')
+        });
+        
+        var togglId;
+        var togglDefaultWorkspaceId;
+        var linkList = $('#link-list');
+        $.get('https://www.toggl.com/api/v8/me',
+        function (response) {
+            togglId = response.data.id;
+            togglDefaultWorkspaceId = response.data.default_wid;
 
-            $('#myDisplayName').html(myDisplayName + ' (' + myEmailAddress + ')')
+            var startDate = new Date();
+            startDate.setDate(startDate.getDate() - 1);
+
+            var endDate = new Date();
+            
+            myEmailAddress = response.data.email;
+            myDisplayName = response.data.fullname;
+            
+            $('#myTogglDisplayName').html(myDisplayName + ' (' + myEmailAddress + ')')
+
+            var dom = '<li><a href="https://toggl.com/app/reports/detailed/' + togglDefaultWorkspaceId + '/from/' + startDate.yyyy_mm_dd() + '/to/' + endDate.yyyy_mm_dd() + '/users/' + togglId + '" target="_blank">My Report</a></li>';
+            linkList.append(dom);
         });
 }
-
 function submitEntries() {
 
     // log time for each jira ticket
@@ -153,7 +187,7 @@ function submitEntries() {
                 started: log.started
             });
 
-            $.post(config.url + '/rest/api/latest/issue/' + log.issue + '/worklog', body,
+            $.post(config.url + '/rest/api/latest/issue/' + log.issue.replace(jiraIssueReplaceRegExp, "$1") + '/worklog', body,
                 function success(response) {
                     console.log('success', response);
                     $('#result-' + log.id).text('OK').addClass('success').removeClass('info');
@@ -185,8 +219,6 @@ function selectEntry() {
 function fetchEntries() {
     var startDate = document.getElementById('start-picker').valueAsDate.toISOString();
     var endDate = document.getElementById('end-picker').valueAsDate.toISOString();
-    localStorage.setItem('toggl-to-jira.last-date', startDate);
-    localStorage.setItem('toggl-to-jira.last-end-date', endDate);
     $('p#error').text("").removeClass('error');
 
     var dateQuery = '?start_date=' + startDate + '&end_date=' + endDate;
@@ -198,6 +230,9 @@ function fetchEntries() {
         entries.forEach(function (entry) {
             entry.description = entry.description || 'no-description';
             var issue = entry.description.split(' ')[0];
+            
+            if (!jiraIssueTestRegExp.test(issue)) return;
+            
             var togglTime = roundUp(entry.duration, config.roundMinutes);
 
             var dateString = toJiraWhateverDateTime(entry.start);
@@ -233,6 +268,8 @@ function fetchEntries() {
         });
 
         renderList();
+        localStorage.setItem('toggl-to-jira.last-date', startDate);
+        localStorage.setItem('toggl-to-jira.last-end-date', endDate);
     });
 }
 
@@ -297,7 +334,7 @@ function renderList() {
     var totalTime = 0;
 
     logs.forEach(function (log) {
-        var url = config.url + '/browse/' + log.issue;
+        var url = config.url + '/browse/' + log.issue.replace(jiraIssueReplaceRegExp, "$1");
         var dom = '<tr><td>';
 
         // checkbox
@@ -332,10 +369,13 @@ function renderList() {
     // total time for displayed tickets
     list.append('<tr><td></td><td></td><td></td><td><b>TOTAL</b></td><td>' + totalTime.toString().toHHMM() + '</td></tr>');
 
-    // check if entry was already logged
+    // check if entry was already logged or has no jira ID
     logs.forEach(function (log) {
-        $.get(config.url + '/rest/api/latest/issue/' + log.issue + '/worklog',
-            function success(response) {
+        $.ajax({
+            url: config.url + '/rest/api/latest/issue/' + log.issue.replace(jiraIssueReplaceRegExp, "$1") + '/worklog',
+            type: 'GET',
+            success: function (response) {
+                //var response = $(data);
                 var worklogs = response.worklogs;
                 worklogs.forEach(function (worklog) {
                     if (!!myEmailAddress && !!worklog.author && worklog.author.emailAddress !== myEmailAddress) { return; }
@@ -353,7 +393,14 @@ function renderList() {
                         log.submit = false;
                     }
                 })
-            });
+            },
+            error: function (data) {
+                $('#result-' + log.id).text('skipped').addClass('error').removeClass('info');
+                $('#input-' + log.id).removeAttr('checked').attr('disabled', 'disabled');
+                //$("#comment-" + log.id).val(worklog.comment || '').attr('disabled', 'disabled');
+                log.submit = false;
+            }
+        });
     });
 
 }
